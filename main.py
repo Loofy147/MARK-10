@@ -1,61 +1,7 @@
 import numpy as np
 import torch
-from agent import Agent
-
-class KeyDoorEnv:
-    def __init__(self, size=5):
-        self.size = size
-        self.agent_pos = None
-        self.key_pos = None
-        self.door_pos = None
-        self.has_key = False
-        self.goal = None
-
-    def reset(self):
-        self.agent_pos = np.random.randint(0, self.size, size=2)
-        self.key_pos = np.random.randint(0, self.size, size=2)
-        self.door_pos = np.random.randint(0, self.size, size=2)
-        self.has_key = False
-
-        while np.array_equal(self.agent_pos, self.key_pos) or \
-              np.array_equal(self.agent_pos, self.door_pos) or \
-              np.array_equal(self.key_pos, self.door_pos):
-            self.key_pos = np.random.randint(0, self.size, size=2)
-            self.door_pos = np.random.randint(0, self.size, size=2)
-
-        self.goal = np.concatenate([self.door_pos, [1]]) # goal is to be at the door with the key
-
-        return self._get_obs()
-
-    def _get_obs(self):
-        obs = np.concatenate([self.agent_pos, self.key_pos, [self.has_key]])
-        return {
-            "observation": obs,
-            "achieved_goal": np.concatenate([self.agent_pos, [self.has_key]]),
-            "desired_goal": self.goal,
-        }
-
-    def compute_reward(self, achieved_goal, desired_goal):
-        # Reward is -1 unless the goal is achieved
-        if np.array_equal(achieved_goal, desired_goal):
-            return 0.0
-        return -1.0
-
-    def step(self, action):
-        # 0: up, 1: down, 2: left, 3: right
-        if action == 0: self.agent_pos[0] = max(0, self.agent_pos[0] - 1)
-        elif action == 1: self.agent_pos[0] = min(self.size - 1, self.agent_pos[0] + 1)
-        elif action == 2: self.agent_pos[1] = max(0, self.agent_pos[1] - 1)
-        elif action == 3: self.agent_pos[1] = min(self.size - 1, self.agent_pos[1] + 1)
-
-        if not self.has_key and np.array_equal(self.agent_pos, self.key_pos):
-            self.has_key = True
-
-        obs = self._get_obs()
-        reward = self.compute_reward(obs["achieved_goal"], obs["desired_goal"])
-        done = (reward == 0.0)
-
-        return obs, reward, done, {}
+from agent import Manager, LowLevelController, LatentGoalModule, HERRetrievalBuffer
+from env import KeyDoorEnv
 
 def main():
     env = KeyDoorEnv()
@@ -63,34 +9,65 @@ def main():
     obs_dim = obs["observation"].shape[0]
     goal_dim = obs["desired_goal"].shape[0]
     action_dim = 4
+    latent_dim = 8
+    manager_batch_size = 64
+    llc_batch_size = 64
+    c = 5  # Manager action frequency
 
-    agent = Agent(obs_dim + goal_dim, action_dim, obs_dim, goal_dim, eta=0.01)
+    manager = Manager(obs_dim, latent_dim)
+    llc = LowLevelController(obs_dim, action_dim, latent_dim)
+    latent_module = LatentGoalModule(obs_dim, latent_dim)
+    latent_module_optimizer = torch.optim.Adam(latent_module.parameters(), lr=1e-4)
+    replay_buffer = HERRetrievalBuffer(1000, obs_dim, goal_dim, latent_module)
 
-    episodes = 100
+    episodes = 200
     max_steps = 50
-    successes = 0
 
     for e in range(episodes):
         obs = env.reset()
+        done = False
+        step = 0
         episode_trajectory = []
-        for step in range(max_steps):
-            state_for_policy = np.concatenate([obs["observation"], obs["desired_goal"]])
-            action = agent.select_action(state_for_policy)
-            next_obs, reward, done, _ = env.step(action)
 
-            episode_trajectory.append((obs, action, reward, next_obs, done))
-            obs = next_obs
+        while not done and step < max_steps:
+            start_obs_for_manager = obs["observation"]
+            latent_goal = manager.select_goal(start_obs_for_manager)
 
-            if done:
-                successes += 1
-                break
+            macro_step_trajectory = []
+            for _ in range(c):
+                action = llc.select_action(obs["observation"], latent_goal)
+                next_obs, reward, done, _ = env.step(action)
 
-        agent.replay_buffer.add_episode(episode_trajectory)
-        agent.train(env.compute_reward)
-        agent.update_target_networks()
+                macro_step_trajectory.append((obs, action, reward, next_obs, done, latent_goal))
+                obs = next_obs
+                step += 1
+                if done or step >= max_steps:
+                    break
+
+            replay_buffer.add_macro_step(macro_step_trajectory)
+            episode_trajectory.extend(macro_step_trajectory)
+
+        # Train Low-Level Controller
+        llc.train(replay_buffer)
+
+        # Train Manager and Latent Module
+        s_starts, s_ends, orig_goals, rewards = replay_buffer.sample_manager_batch(manager_batch_size)
+        if len(s_starts) > 0:
+            manager.train(s_starts, s_ends, rewards, latent_module)
+
+            # Train the latent goal module
+            latent_module.train_step(torch.FloatTensor(s_starts), torch.FloatTensor(s_ends), torch.FloatTensor(orig_goals), latent_module_optimizer)
+
 
         if (e + 1) % 10 == 0:
-            print(f"Episode {e+1}/{episodes}, Success Rate: {successes / (e+1):.2f}")
+            # Simple success metric: was the final goal achieved?
+            if episode_trajectory:
+                final_achieved = episode_trajectory[-1][3]["achieved_goal"]
+                final_desired = episode_trajectory[-1][3]["desired_goal"]
+                success = np.array_equal(final_achieved, final_desired)
+                print(f"Episode {e+1}/{episodes}, Success: {success}")
+            else:
+                print(f"Episode {e+1}/{episodes}, Success: False (No steps taken)")
 
 if __name__ == "__main__":
     main()
