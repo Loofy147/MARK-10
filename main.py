@@ -18,7 +18,7 @@ def main():
     llc = LowLevelController(obs_dim, action_dim, latent_dim)
     latent_module = LatentGoalModule(obs_dim, latent_dim)
     latent_module_optimizer = torch.optim.Adam(latent_module.parameters(), lr=1e-4)
-    replay_buffer = HERRetrievalBuffer(1000, obs_dim, goal_dim, latent_module)
+    replay_buffer = HERRetrievalBuffer(1000, obs_dim, latent_module)
 
     episodes = 200
     max_steps = 50
@@ -49,11 +49,13 @@ def main():
 
         # Train Low-Level Controller
         llc.train(replay_buffer)
+        llc.update_target_networks()
 
         # Train Manager and Latent Module
         s_starts, s_ends, orig_goals, rewards = replay_buffer.sample_manager_batch(manager_batch_size)
         if len(s_starts) > 0:
             manager.train(s_starts, s_ends, rewards, latent_module)
+            manager.update_target_networks()
 
             # Train the latent goal module
             latent_module.train_step(torch.FloatTensor(s_starts), torch.FloatTensor(s_ends), torch.FloatTensor(orig_goals), latent_module_optimizer)

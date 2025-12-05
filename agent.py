@@ -29,10 +29,9 @@ def compute_conservative_loss(q_nets, states, actions, target_q, alpha=1.0):
     return total_loss
 
 class HERRetrievalBuffer:
-    def __init__(self, capacity, obs_dim, goal_dim, latent_goal_module, her_ratio=0.8, rer_ratio=0.2):
+    def __init__(self, capacity, obs_dim, latent_goal_module, her_ratio=0.8, rer_ratio=0.2):
         self.capacity = capacity
         self.obs_dim = obs_dim
-        self.goal_dim = goal_dim
         self.latent_goal_module = latent_goal_module
         self.her_ratio = her_ratio
         self.rer_ratio = rer_ratio
@@ -253,6 +252,11 @@ class LowLevelController:
         loss.backward()
         self.optimizer.step()
 
+    def update_target_networks(self, tau=0.005):
+        for i in range(3):
+            for target_param, param in zip(self.target_q_nets[i].parameters(), self.q_nets[i].parameters()):
+                target_param.data.copy_(tau * param.data + (1.0 - tau) * target_param.data)
+
 class Manager:
     def __init__(self, state_dim, latent_dim, gamma=0.99, lr=1e-4):
         self.gamma = gamma
@@ -301,3 +305,8 @@ class Manager:
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
         self.actor_optimizer.step()
+
+    def update_target_networks(self, tau=0.005):
+        for i in range(3):
+            for target_param, param in zip(self.target_critics[i].parameters(), self.critics[i].parameters()):
+                target_param.data.copy_(tau * param.data + (1.0 - tau) * target_param.data)
